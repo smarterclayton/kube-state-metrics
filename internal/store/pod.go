@@ -729,6 +729,73 @@ var (
 			}),
 		},
 		{
+			Name: "kube_pod_resources",
+			Type: metric.Gauge,
+			Help: "The resource requests and limits for a pod.",
+			GenerateFunc: wrapPodFunc(func(p *v1.Pod) *metric.Family {
+				ms := []*metric.Metric{}
+
+				lifecycle, reqs, currentReqs, limits, currentLimits := podRequestsAndLimitsByLifecycle(p)
+				for _, t := range []struct {
+					lifecycle string
+					name      string
+					resources v1.ResourceList
+				}{
+					{lifecycle: "", name: "requests", resources: currentReqs},
+					{lifecycle: lifecycle, name: "requests", resources: reqs},
+					{lifecycle: "", name: "limits", resources: currentLimits},
+					{lifecycle: lifecycle, name: "limits", resources: limits},
+				} {
+					req := t.resources
+					for resourceName, val := range req {
+						switch resourceName {
+						case v1.ResourceCPU:
+							ms = append(ms, &metric.Metric{
+								LabelValues: []string{t.lifecycle, "", t.name, sanitizeLabelName(p.Spec.NodeName), sanitizeLabelName(string(resourceName)), string(constant.UnitCore)},
+								Value:       float64(val.MilliValue()) / 1000,
+							})
+						case v1.ResourceStorage:
+							fallthrough
+						case v1.ResourceEphemeralStorage:
+							fallthrough
+						case v1.ResourceMemory:
+							ms = append(ms, &metric.Metric{
+								LabelValues: []string{t.lifecycle, "", t.name, sanitizeLabelName(p.Spec.NodeName), sanitizeLabelName(string(resourceName)), string(constant.UnitByte)},
+								Value:       float64(val.Value()),
+							})
+						default:
+							if isHugePageResourceName(resourceName) {
+								ms = append(ms, &metric.Metric{
+									LabelValues: []string{t.lifecycle, "", t.name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(constant.UnitByte)},
+									Value:       float64(val.Value()),
+								})
+							}
+							if isAttachableVolumeResourceName(resourceName) {
+								ms = append(ms, &metric.Metric{
+									LabelValues: []string{t.lifecycle, "", t.name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(constant.UnitByte)},
+									Value:       float64(val.Value()),
+								})
+							}
+							if isExtendedResourceName(resourceName) {
+								ms = append(ms, &metric.Metric{
+									LabelValues: []string{t.lifecycle, "", t.name, p.Spec.NodeName, sanitizeLabelName(string(resourceName)), string(constant.UnitInteger)},
+									Value:       float64(val.Value()),
+								})
+							}
+						}
+					}
+				}
+
+				for _, metric := range ms {
+					metric.LabelKeys = []string{"lifecycle", "container", "type", "node", "resource", "unit"}
+				}
+
+				return &metric.Family{
+					Metrics: ms,
+				}
+			}),
+		},
+		{
 			Name: "kube_pod_container_resource_requests",
 			Type: metric.Gauge,
 			Help: "The number of requested request resource by a container.",
@@ -1087,4 +1154,122 @@ func lastTerminationReason(cs v1.ContainerStatus, reason string) bool {
 		return false
 	}
 	return cs.LastTerminationState.Terminated.Reason == reason
+}
+
+// addResourceList adds the resources in newList to list
+func addResourceList(list, newList v1.ResourceList) {
+	for name, quantity := range newList {
+		if value, ok := list[name]; !ok {
+			list[name] = quantity.DeepCopy()
+		} else {
+			value.Add(quantity)
+			list[name] = value
+		}
+	}
+}
+
+// maxResourceList sets list to the greater of list/newList for every resource
+// either list
+func maxResourceList(list, new v1.ResourceList) {
+	for name, quantity := range new {
+		if value, ok := list[name]; !ok {
+			list[name] = quantity.DeepCopy()
+			continue
+		} else {
+			if quantity.Cmp(value) > 0 {
+				list[name] = quantity.DeepCopy()
+			}
+		}
+	}
+}
+
+// podRequestsAndLimitsByLifecycle returns a dictionary of all defined resources summed up for all
+// containers of the pod. If PodOverhead feature is enabled, pod overhead is added to the
+// total container resource requests and to the total container limits which have a
+// non-zero quantity.
+func podRequestsAndLimitsByLifecycle(pod *v1.Pod) (lifecycle string, reqs, currentReqs, limits, currentLimits v1.ResourceList) {
+	var terminal, initializing, running bool
+	switch {
+	case len(pod.Spec.NodeName) == 0:
+		lifecycle = "Pending"
+	case pod.Status.Phase == v1.PodSucceeded, pod.Status.Phase == v1.PodFailed:
+		lifecycle = "Completed"
+		terminal = true
+	default:
+		if len(pod.Spec.InitContainers) > 0 && !hasConditionStatus(pod.Status.Conditions, v1.PodInitialized, v1.ConditionTrue) {
+			lifecycle = "Initializing"
+			initializing = true
+		} else {
+			lifecycle = "Running"
+			running = true
+		}
+	}
+	if terminal {
+		return
+	}
+
+	reqs, limits, currentReqs, currentLimits = make(v1.ResourceList, 4), make(v1.ResourceList, 4), make(v1.ResourceList, 4), make(v1.ResourceList, 4)
+	for _, container := range pod.Spec.Containers {
+		addResourceList(reqs, container.Resources.Requests)
+		addResourceList(limits, container.Resources.Limits)
+
+		if running {
+			addResourceList(currentReqs, container.Resources.Requests)
+			addResourceList(currentLimits, container.Resources.Limits)
+		}
+	}
+	// init containers define the minimum of any resource
+	var currentInitializingContainer string
+	if len(pod.Spec.InitContainers) > 0 {
+		currentInitializingContainer = pod.Spec.InitContainers[0].Name
+	}
+	for _, status := range pod.Status.InitContainerStatuses {
+		if status.State.Terminated != nil {
+			continue
+		}
+		currentInitializingContainer = status.Name
+		break
+	}
+	for _, container := range pod.Spec.InitContainers {
+		maxResourceList(reqs, container.Resources.Requests)
+		maxResourceList(limits, container.Resources.Limits)
+
+		if initializing && currentInitializingContainer == container.Name {
+			maxResourceList(currentReqs, container.Resources.Requests)
+			maxResourceList(currentLimits, container.Resources.Limits)
+		}
+	}
+
+	// if PodOverhead feature is supported, add overhead for running a pod
+	// to the sum of reqeuests and to non-zero limits:
+	if pod.Spec.Overhead != nil {
+		addResourceList(reqs, pod.Spec.Overhead)
+		for name, quantity := range pod.Spec.Overhead {
+			if value, ok := limits[name]; ok && !value.IsZero() {
+				value.Add(quantity)
+				limits[name] = value
+			}
+		}
+		if initializing || running {
+			addResourceList(reqs, pod.Spec.Overhead)
+			for name, quantity := range pod.Spec.Overhead {
+				if value, ok := limits[name]; ok && !value.IsZero() {
+					value.Add(quantity)
+					limits[name] = value
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func hasConditionStatus(conditions []v1.PodCondition, name v1.PodConditionType, status v1.ConditionStatus) bool {
+	for _, condition := range conditions {
+		if condition.Type != name {
+			continue
+		}
+		return condition.Status == status
+	}
+	return false
 }
